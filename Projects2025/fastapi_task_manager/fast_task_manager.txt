@@ -1,0 +1,2046 @@
+
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\main.py =====
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from sqlalchemy.exc import SQLAlchemyError
+from redis.exceptions import RedisError
+from datetime import datetime
+import logging
+
+from app.api.v1.routes import user, task, comment, auth
+from app.core.config import settings
+from app.core.cache import cache
+from app.db.session import AsyncSessionLocal
+from sqlalchemy import select
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("task_manager.main")
+
+app = FastAPI(
+    title="Task Manager API",
+    version="1.0.0",
+    description="Production-grade task management API with JWT auth, RBAC, and caching"
+)
+
+# Initialize rate limiter
+limiter = Limiter(key_func=get_remote_address, default_limits=["1000/hour"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Custom rate limit error response
+@app.exception_handler(RateLimitExceeded)
+async def custom_rate_limit_handler(request, exc: RateLimitExceeded):
+    logger.warning(f"Rate limit exceeded for {request.client.host}")
+    return JSONResponse(
+        status_code=429,
+        content={
+            "detail": "Rate limit exceeded",
+            "retry_after": exc.detail,
+            "error_code": "RATE_LIMIT_EXCEEDED"
+        },
+        headers={"X-RateLimit-Reset": str(exc.detail)}
+    )
+
+# Database error handler
+@app.exception_handler(SQLAlchemyError)
+async def database_exception_handler(request, exc: SQLAlchemyError):
+    logger.error(f"Database error: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Database error occurred",
+            "error_code": "DATABASE_ERROR"
+        }
+    )
+
+# Redis error handler
+@app.exception_handler(RedisError)
+async def redis_exception_handler(request, exc: RedisError):
+    logger.error(f"Redis error: {exc}")
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "Cache service temporarily unavailable",
+            "error_code": "CACHE_ERROR"
+        }
+    )
+
+# General exception handler
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc: Exception):
+    logger.error(f"Unexpected error: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal server error",
+            "error_code": "INTERNAL_ERROR"
+        }
+    )
+
+# Health check endpoints
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for load balancers"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow(),
+        "service": "task-manager-api"
+    }
+
+@app.get("/health/ready")
+async def readiness_check():
+    """Readiness check - verify DB and Redis connections"""
+    try:
+        # Test DB connection
+        async with AsyncSessionLocal() as db:
+            await db.execute(select(1))
+
+        # Test Redis connection
+        if cache.redis_client:
+            await cache.redis_client.ping()
+        else:
+            await cache.connect()
+            await cache.redis_client.ping()
+
+        return {
+            "status": "ready",
+            "services": {"database": "ok", "redis": "ok"},
+            "timestamp": datetime.utcnow()
+        }
+    except Exception as e:
+        logger.error(f"Readiness check failed: {e}")
+        raise HTTPException(status_code=503, detail=f"Service unavailable: {str(e)}")
+
+# Include routers
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["Authentication"])
+app.include_router(user.router, prefix="/api/v1/users", tags=["Users"])
+app.include_router(task.router, prefix="/api/v1/tasks", tags=["Tasks"])
+app.include_router(comment.router, prefix="/api/v1/comments", tags=["Comments"])
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Starting up Task Manager API...")
+    await cache.connect()
+    logger.info("Cache connected successfully")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Shutting down Task Manager API...")
+    await cache.disconnect()
+    logger.info("Cache disconnected successfully")
+
+if __name__ == '__main__':
+    import uvicorn
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8002,
+        log_level="info",
+        reload=settings.ENVIRONMENT == "development"
+    )
+
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\worker.py =====
+
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import httpx
+from app.core.celery_app import celery_app
+from app.db.session import AsyncSessionLocal
+from app.api.v1.crud import task as crud_task
+import asyncio
+import logging
+from tenacity import after_log
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@celery_app.task
+def fetch_task_metadata(task_id: int):
+    """Celery task to fetch external metadata (sync wrapper for async function)"""
+    return asyncio.run(_fetch_task_metadata_async(task_id))
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError)),
+    after=after_log(logger, logging.WARNING)
+)
+async def _fetch_task_metadata_async(task_id: int):
+    """Internal async function for fetching task metadata"""
+    async with AsyncSessionLocal() as db:
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"https://jsonplaceholder.typicode.com/todos/{task_id}")
+                resp.raise_for_status()
+                metadata = resp.json()
+
+            task = await crud_task.get_task_by_id(db, task_id)
+            if task:
+                await crud_task.update_task_metadata(db, task, metadata)
+                logger.info(f"Updated task {task_id} with metadata")
+            else:
+                logger.warning(f"Task {task_id} not found")
+
+        except Exception as e:
+            logger.error(f"Failed to fetch metadata for task {task_id}: {e}")
+            raise
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\__init__.py =====
+
+
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\api\deps.py =====
+
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.api.v1.crud import user as crud_user
+from app.schemas.user import TokenData
+from app.db.session import get_db_session
+from app.models.user import User
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
+
+async def get_current_user(
+        token: str = Depends(oauth2_scheme),
+        db: AsyncSession = Depends(get_db_session)
+) -> User:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        user_id: str = payload.get("sub")
+        role: str = payload.get("role")
+        if user_id is None or role is None:
+            raise credentials_exception
+        token_data = TokenData(user_id=int(user_id), role=role)
+    except JWTError:
+        raise credentials_exception
+
+    user = await crud_user.get_user_by_id(db, token_data.user_id)
+    if user is None:
+        raise credentials_exception
+    return user
+
+
+
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\api\__init__.py =====
+
+
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\api\v1\__init__.py =====
+
+
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\api\v1\crud\comment.py =====
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, delete
+from typing import List, Optional
+from app.models.comment import Comment
+from app.schemas.comment import CommentCreate
+from typing import Tuple
+
+# ----- Create a new comment -----
+async def create_comment(db: AsyncSession, comment_in: CommentCreate, user_id: int) -> Comment:
+    """
+    Create a new comment.
+
+    Args:
+        db: Database session
+        comment_in: Comment creation data from request
+        user_id: ID of the user creating the comment
+
+    Returns:
+        Comment: The created comment object
+    """
+    comment_data = comment_in.dict()
+    comment_data["user_id"] = user_id  # Set the user_id from auth context
+
+    new_comment = Comment(**comment_data)
+    db.add(new_comment)
+    await db.commit()
+    await db.refresh(new_comment)
+    return new_comment
+
+# ----- Get comments for a specific user -----
+async def get_comments_by_user(db: AsyncSession, user_id: int) -> List[Comment]:
+    result = await db.execute(select(Comment).where(Comment.user_id == user_id))
+    return result.scalars().all()
+
+# ----- Get all comments (with optional filters and pagination) -----
+async def get_all_comments(
+        db: AsyncSession,
+        task_id: Optional[int] = None,
+        user_id: Optional[int] = None,
+        skip: int = 0,
+        limit: int = 20
+) -> List[Comment]:
+    query = select(Comment)
+
+    if task_id is not None:
+        query = query.where(Comment.task_id == task_id)
+    if user_id is not None:
+        query = query.where(Comment.user_id == user_id)
+
+    query = query.offset(skip).limit(limit)
+    result = await db.execute(query)
+    return result.scalars().all()
+
+# ----- Get user-related comments (for regular users) -----
+async def get_user_related_comments(
+        db: AsyncSession,
+        user_id: int,
+        task_id: Optional[int] = None,
+        skip: int = 0,
+        limit: int = 20
+) -> List[Comment]:
+    query = select(Comment).where(Comment.user_id == user_id)
+
+    if task_id is not None:
+        query = query.where(Comment.task_id == task_id)
+
+    query = query.offset(skip).limit(limit)
+    result = await db.execute(query)
+    return result.scalars().all()
+
+# ----- Get a single comment by ID -----
+async def get_comment_by_id(db: AsyncSession, comment_id: int) -> Optional[Comment]:
+    result = await db.execute(select(Comment).where(Comment.id == comment_id))
+    return result.scalars().first()
+
+# ----- Delete a comment -----
+async def delete_comment(db: AsyncSession, comment: Comment):
+    await db.delete(comment)
+    await db.commit()
+
+async def get_comments_with_pagination(
+        db: AsyncSession,
+        pagination: PaginationParams,
+        filters: CommentFilters
+) -> Tuple[List[Comment], int]:
+    """Get comments with pagination and filtering for admins."""
+    from sqlalchemy import func, and_
+
+    query = select(Comment).options(
+        selectinload(Comment.author),
+        selectinload(Comment.task)
+    )
+
+    conditions = []
+    if filters.task_id:
+        conditions.append(Comment.task_id == filters.task_id)
+    if filters.user_id:
+        conditions.append(Comment.user_id == filters.user_id)
+    if filters.content_contains:
+        conditions.append(Comment.content.ilike(f"%{filters.content_contains}%"))
+
+    if conditions:
+        query = query.where(and_(*conditions))
+
+    # Get total count
+    count_query = select(func.count(Comment.id))
+    if conditions:
+        count_query = count_query.where(and_(*conditions))
+
+    total_result = await db.execute(count_query)
+    total = total_result.scalar()
+
+    # Apply pagination
+    query = query.order_by(Comment.created_at.desc()).offset(pagination.offset).limit(pagination.limit)
+    result = await db.execute(query)
+    comments = result.scalars().all()
+
+    return comments, total
+
+async def get_user_related_comments_with_pagination(
+        db: AsyncSession,
+        user_id: int,
+        pagination: PaginationParams,
+        filters: CommentFilters
+) -> Tuple[List[Comment], int]:
+    """Get user-related comments with pagination."""
+    from sqlalchemy import func, and_, or_
+    from app.models.task import Task
+
+    # Comments user made OR comments on user's tasks
+    query = select(Comment).options(
+        selectinload(Comment.author),
+        selectinload(Comment.task)
+    ).join(Task, Comment.task_id == Task.id).where(
+        or_(
+            Comment.user_id == user_id,
+            Task.owner_id == user_id
+        )
+    )
+
+    conditions = []
+    if filters.task_id:
+        conditions.append(Comment.task_id == filters.task_id)
+    if filters.content_contains:
+        conditions.append(Comment.content.ilike(f"%{filters.content_contains}%"))
+
+    if conditions:
+        query = query.where(and_(*conditions))
+
+    # Get total count
+    count_query = select(func.count(Comment.id)).join(Task, Comment.task_id == Task.id).where(
+        or_(
+            Comment.user_id == user_id,
+            Task.owner_id == user_id
+        )
+    )
+    if conditions:
+        count_query = count_query.where(and_(*conditions))
+
+    total_result = await db.execute(count_query)
+    total = total_result.scalar()
+
+    # Apply pagination
+    query = query.order_by(Comment.created_at.desc()).offset(pagination.offset).limit(pagination.limit)
+    result = await db.execute(query)
+    comments = result.scalars().all()
+
+    return comments, total
+
+async def update_comment(db: AsyncSession, comment: Comment, updates: dict) -> Comment:
+    """Update a comment."""
+    for key, value in updates.items():
+        setattr(comment, key, value)
+    db.add(comment)
+    await db.commit()
+    await db.refresh(comment)
+    return comment
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\api\v1\crud\task.py =====
+
+# app/api/v1/crud/task.py
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import OperationalError
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update, delete, func, and_, or_
+from sqlalchemy.orm import selectinload
+from typing import List, Optional, Tuple
+from datetime import datetime
+from app.models.task import Task
+from app.schemas.task import TaskCreate
+from app.schemas.pagination import TaskFilters, PaginationParams
+
+from fastapi import HTTPException
+
+@retry(
+    stop=stop_after_attempt(3),  # Retry 3 times
+    wait=wait_fixed(2),  # Wait 2s between retries
+    retry=retry_if_exception_type(OperationalError)  # Retry on DB connection errors
+)
+# ----- Create a new task -----
+async def create_task(db: AsyncSession, task_in: TaskCreate, owner_id: int) -> Task:
+    """Create a new task."""
+    task_data = task_in.dict()
+    task_data["owner_id"] = owner_id
+    new_task = Task(**task_data)
+    db.add(new_task)
+    await db.commit()
+    await db.refresh(new_task)
+    return new_task
+
+# ----- Get tasks with filtering and pagination -----
+async def get_tasks_with_pagination(
+        db: AsyncSession,
+        pagination: PaginationParams,
+        filters: TaskFilters,
+        current_user_id: int,
+        is_admin: bool = False
+) -> Tuple[List[Task], int]:
+    """Get tasks with pagination and filtering. Raises HTTP 400 for invalid ISO date formats."""
+    # Base query with relationships
+    query = select(Task).options(
+        selectinload(Task.owner),
+        selectinload(Task.comments)
+    )
+
+    # Build filter conditions
+    conditions = []
+
+    # Permission-based filtering
+    if not is_admin:
+        conditions.append(Task.owner_id == current_user_id)
+    elif filters.owner_id is not None:
+        conditions.append(Task.owner_id == filters.owner_id)
+
+    # Status filter
+    if filters.status:
+        conditions.append(Task.status.ilike(f"%{filters.status}%"))
+
+    # Title search
+    if filters.title_contains:
+        conditions.append(Task.title.ilike(f"%{filters.title_contains}%"))
+
+    # Date filters
+    if filters.created_after:
+        try:
+            date_after = datetime.fromisoformat(filters.created_after.replace('Z', '+00:00'))
+            conditions.append(Task.created_at >= date_after)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid created_after date format")
+
+    if filters.created_before:
+        try:
+            date_before = datetime.fromisoformat(filters.created_before.replace('Z', '+00:00'))
+            conditions.append(Task.created_at <= date_before)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid created_before date format")
+
+    # Apply filters
+    if conditions:
+        query = query.where(and_(*conditions))
+
+    # Get total count for pagination
+    count_query = select(func.count(Task.id))
+    if conditions:
+        count_query = count_query.where(and_(*conditions))
+
+    total_result = await db.execute(count_query)
+    total = total_result.scalar()
+
+    # Apply pagination and ordering
+    query = (
+        query
+        .order_by(Task.created_at.desc())
+        .offset(pagination.offset)
+        .limit(pagination.limit)
+    )
+
+    result = await db.execute(query)
+    tasks = result.scalars().all()
+
+    return tasks, total
+
+# ----- Get all tasks (admin only, with optional filters) -----
+async def get_all_tasks(
+        db: AsyncSession,
+        owner_id: Optional[int] = None,
+        status: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 20
+) -> List[Task]:
+    """Get all tasks with optional filters (admin only)."""
+    query = select(Task).options(
+        selectinload(Task.owner),
+        selectinload(Task.comments)
+    )
+
+    conditions = []
+    if owner_id is not None:
+        conditions.append(Task.owner_id == owner_id)
+    if status is not None:
+        conditions.append(Task.status.ilike(f"%{status}%"))
+
+    if conditions:
+        query = query.where(and_(*conditions))
+
+    query = query.order_by(Task.created_at.desc()).offset(skip).limit(limit)
+    result = await db.execute(query)
+    return result.scalars().all()
+
+# ----- Get user tasks with filters -----
+async def get_user_tasks(
+        db: AsyncSession,
+        owner_id: int,
+        status: Optional[str] = None,
+        title_contains: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 20
+) -> List[Task]:
+    """Get tasks for specific user with filters."""
+    query = select(Task).options(
+        selectinload(Task.owner),
+        selectinload(Task.comments)
+    ).where(Task.owner_id == owner_id)
+
+    conditions = []
+    if status is not None:
+        conditions.append(Task.status.ilike(f"%{status}%"))
+    if title_contains is not None:
+        conditions.append(Task.title.ilike(f"%{title_contains}%"))
+
+    if conditions:
+        query = query.where(and_(*conditions))
+
+    query = query.order_by(Task.created_at.desc()).offset(skip).limit(limit)
+    result = await db.execute(query)
+    return result.scalars().all()
+
+# ----- Get a single task by ID -----
+async def get_task_by_id(db: AsyncSession, task_id: int) -> Optional[Task]:
+    """Get single task with relationships loaded."""
+    result = await db.execute(
+        select(Task)
+        .options(
+            selectinload(Task.owner),
+            selectinload(Task.comments)
+        )
+        .where(Task.id == task_id)
+    )
+    return result.scalars().first()
+
+# ----- Update a task -----
+async def update_task(db: AsyncSession, task_id: int, updates: dict) -> Optional[Task]:
+    """Update a Task and return the updated Task object."""
+    result = await db.execute(
+        update(Task)
+        .where(Task.id == task_id)
+        .values(**updates)
+        .returning(Task)
+    )
+
+    updated_task = result.fetchone()
+    await db.commit()
+
+    if updated_task is None:
+        return None
+
+    return updated_task[0]
+
+# ----- Delete a task -----
+async def delete_task(db: AsyncSession, task: Task):
+    """Delete a task."""
+    await db.delete(task)
+    await db.commit()
+
+# ----- Update task metadata (for Celery) -----
+async def update_task_metadata(db: AsyncSession, task: Task, metadata: dict):
+    """Update the metadata field of a task."""
+    task.task_metadata = metadata
+    db.add(task)
+    await db.commit()
+    await db.refresh(task)
+
+# ----- Get task statistics -----
+async def get_task_statistics(db: AsyncSession, user_id: int) -> dict:
+    """Get task statistics for a user."""
+    # Count tasks by status
+    status_counts = await db.execute(
+        select(Task.status, func.count(Task.id))
+        .where(Task.owner_id == user_id)
+        .group_by(Task.status)
+    )
+
+    stats = {"total": 0}
+    for status, count in status_counts.fetchall():
+        stats[status.lower()] = count
+        stats["total"] += count
+
+    return stats
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\api\v1\crud\user.py =====
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from typing import List, Optional
+from app.models.user import User
+from app.schemas.user import UserCreate
+from app.core.security import get_password_hash, verify_password
+
+# ----- Create a new user -----
+async def create_user(db: AsyncSession, user_in: UserCreate, role: str = "user") -> User:
+    hashed_password = get_password_hash(user_in.password)
+    user = User(
+        username=user_in.username,
+        email=user_in.email,
+        hashed_password=hashed_password,
+        role=role
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
+# ----- Authenticate user -----
+async def authenticate_user(db: AsyncSession, email: str, password: str) -> Optional[User]:
+    user = await get_user_by_email(db, email)
+    if user and verify_password(password, user.hashed_password):
+        return user
+    return None
+
+# ----- Get user by id -----
+async def get_user_by_id(db: AsyncSession, user_id: int) -> Optional[User]:
+    """
+    Retrieve a user by their unique ID.
+    Returns None if user does not exist.
+    """
+    result = await db.execute(select(User).where(User.id == user_id))
+    return result.scalars().first()
+
+# ----- Get user by email -----
+async def get_user_by_email(db: AsyncSession, email: str) -> Optional[User]:
+    result = await db.execute(select(User).where(User.email == email))
+    return result.scalar_one_or_none()
+
+# ----- Get user by username -----
+async def get_user_by_username(db: AsyncSession, username: str) -> Optional[User]:
+    result = await db.execute(select(User).where(User.username == username))
+    return result.scalar_one_or_none()
+
+# ----- Get all users with optional pagination -----
+async def get_all_users(db: AsyncSession, skip: int = 0, limit: int = 20) -> List[User]:
+    query = select(User).offset(skip).limit(limit)
+    result = await db.execute(query)
+    return result.scalars().all()
+
+# ----- Update a user -----
+async def update_user(db: AsyncSession, user: User, updates: dict) -> User:
+    for key, value in updates.items():
+        if key == "password":
+            setattr(user, "hashed_password", get_password_hash(value))
+        else:
+            setattr(user, key, value)
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+# ----- Delete a user -----
+async def delete_user(db: AsyncSession, user: User):
+    await db.delete(user)
+    await db.commit()
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\api\v1\routes\auth.py =====
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.ext.asyncio import AsyncSession
+from datetime import timedelta
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+from app.schemas.user import UserCreate, UserRead, Token
+from app.api.deps import get_db_session
+from app.api.v1.crud import user as crud_user
+from app.core.security import verify_password, get_password_hash, create_access_token
+from app.core.config import settings
+
+
+limiter = Limiter(key_func=get_remote_address)  # IP-based for unauthenticated
+
+router = APIRouter(tags=["auth"])
+
+# ---------------------------
+# auth.py should only handle authentication & token logic:
+# ----Login endpoint (/auth/login)
+# ----Token generation / validation
+# ----Maybe refresh tokens
+# It should NOT have CRUD logic for users or other tables
+# ---------------------------
+
+# ---------------------------
+# Register endpoint
+# ---------------------------
+
+@router.post("/register", response_model=UserRead, status_code=status.HTTP_201_CREATED)
+@limiter.limit("10/minute")  # 10 requests per minute per IP
+async def register(
+        request,  # Required for slowapi
+        user_in: UserCreate,
+        db: AsyncSession = Depends(get_db_session)
+):
+    existing_user = await crud_user.get_user_by_email(db, user_in.email)
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    user = await crud_user.create_user(db, user_in)
+    return user
+
+
+# ---------------------------
+# Login endpoint
+# ---------------------------
+@router.post("/login", response_model=Token)
+@limiter.limit("10/minute")  # Strict limit to prevent brute-force
+async def login(
+        request,  # Required for slowapi
+        form_data: OAuth2PasswordRequestForm = Depends(),
+        db: AsyncSession = Depends(get_db_session)
+):
+    user = await crud_user.authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token_data = {
+        "sub": str(user.id),
+        "role": user.role,
+        "email": user.email,
+        "scope": "access"
+    }
+
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data=token_data,
+        expires_delta=access_token_expires
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    }
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\api\v1\routes\comment.py =====
+
+from fastapi import APIRouter, Depends, HTTPException, status, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import List, Optional
+import logging
+from pythonjsonlogger import jsonlogger
+
+from app.api.v1.crud import comment as crud_comment
+from app.api.v1.crud import task as crud_task
+from app.api.deps import get_db_session, get_current_user
+from app.models.user import User
+from app.schemas.comment import CommentCreate, CommentRead
+from app.schemas.pagination import PaginatedResponse, PaginationParams, CommentFilters
+from app.core.cache import cache
+
+# Configure JSON logger
+logger = logging.getLogger("task_manager.comment")
+log_handler = logging.StreamHandler()
+formatter = jsonlogger.JsonFormatter(
+    fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ"
+)
+log_handler.setFormatter(formatter)
+logger.addHandler(log_handler)
+logger.setLevel(logging.INFO)
+
+router = APIRouter(tags=["comments"])
+
+# ----- Create a new comment -----
+@router.post("/", response_model=CommentRead, status_code=status.HTTP_201_CREATED)
+async def create_comment(
+        comment_in: CommentCreate,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db_session)
+):
+    """Create a new comment on a task."""
+    # Verify task exists
+    task = await crud_task.get_task_by_id(db, comment_in.task_id)
+    if not task:
+        logger.warning("Task not found for comment creation",
+                       extra={"user_id": current_user.id, "task_id": comment_in.task_id})
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # Regular users can comment only on their own tasks
+    if current_user.role != "admin" and task.owner_id != current_user.id:
+        logger.warning("Forbidden comment creation attempt",
+                       extra={"user_id": current_user.id, "task_id": comment_in.task_id})
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # Create comment
+    comment = await crud_comment.create_comment(db, comment_in, user_id=current_user.id)
+
+    # Invalidate related caches
+    await cache.delete_pattern(f"comments:*")
+    await cache.delete(f"task:{comment_in.task_id}")  # Task cache includes comments
+
+    logger.info("Comment created",
+                extra={"user_id": current_user.id, "comment_id": comment.id, "task_id": comment_in.task_id})
+    return comment
+
+# ----- Get comments with pagination and filtering -----
+@router.get("/", response_model=PaginatedResponse[CommentRead])
+async def get_comments(
+        page: int = Query(1, ge=1, description="Page number"),
+        page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+        task_id: Optional[int] = Query(None, description="Filter by task ID"),
+        user_id: Optional[int] = Query(None, description="Filter by user ID (admin only)"),
+        content_contains: Optional[str] = Query(None, description="Search in comment content"),
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db_session)
+):
+    """Get comments with pagination and filtering."""
+    # Create pagination and filter objects
+    pagination = PaginationParams(page=page, page_size=page_size)
+    filters = CommentFilters(
+        task_id=task_id,
+        user_id=user_id if current_user.role == "admin" else None,
+        content_contains=content_contains
+    )
+
+    # Generate cache key
+    cache_key = f"comments:user:{current_user.id}:page:{page}:size:{page_size}:filters:{hash(str(filters.dict()))}"
+
+    # Try cache first
+    cached_result = await cache.get(cache_key)
+    if cached_result:
+        logger.info("Retrieved comments from cache",
+                    extra={"user_id": current_user.id, "cache_key": cache_key})
+        return PaginatedResponse(**cached_result)
+
+    if current_user.role == "admin":
+        comments, total = await crud_comment.get_comments_with_pagination(
+            db=db, pagination=pagination, filters=filters
+        )
+    else:
+        # Regular users see only their own comments or comments on their tasks
+        comments, total = await crud_comment.get_user_related_comments_with_pagination(
+            db=db,
+            user_id=current_user.id,
+            pagination=pagination,
+            filters=filters
+        )
+
+    # Create paginated response
+    response = PaginatedResponse.create(
+        items=[CommentRead.from_orm(comment) for comment in comments],
+        total=total,
+        page=page,
+        page_size=page_size
+    )
+
+    # Cache for 3 minutes
+    await cache.set(cache_key, response.dict(), expire_seconds=180)
+    logger.info("Fetched comments from DB and cached",
+                extra={"user_id": current_user.id, "cache_key": cache_key, "total_comments": total})
+    return response
+
+# ----- Get single comment by ID -----
+@router.get("/{comment_id}", response_model=CommentRead)
+async def get_comment(
+        comment_id: int,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db_session)
+):
+    """Get a single comment by ID."""
+    comment = await crud_comment.get_comment_by_id(db, comment_id)
+    if not comment:
+        logger.warning("Comment not found",
+                       extra={"user_id": current_user.id, "comment_id": comment_id})
+        raise HTTPException(status_code=404, detail="Comment not found")
+
+    # Regular user can only access own comment or comment on own task
+    if current_user.role != "admin" and comment.user_id != current_user.id:
+        task = await crud_task.get_task_by_id(db, comment.task_id)
+        if not task or task.owner_id != current_user.id:
+            logger.warning("Forbidden comment access attempt",
+                           extra={"user_id": current_user.id, "comment_id": comment_id})
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+    logger.info("Comment retrieved",
+                extra={"user_id": current_user.id, "comment_id": comment_id})
+    return comment
+
+# ----- Update comment -----
+@router.patch("/{comment_id}", response_model=CommentRead)
+async def update_comment(
+        comment_id: int,
+        content: str = Query(..., description="New comment content"),
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db_session)
+):
+    """Update a comment (only content can be updated)."""
+    comment = await crud_comment.get_comment_by_id(db, comment_id)
+    if not comment:
+        logger.warning("Comment not found for update",
+                       extra={"user_id": current_user.id, "comment_id": comment_id})
+        raise HTTPException(status_code=404, detail="Comment not found")
+
+    # Only comment author or admin can update
+    if current_user.role != "admin" and comment.user_id != current_user.id:
+        logger.warning("Forbidden comment update attempt",
+                       extra={"user_id": current_user.id, "comment_id": comment_id})
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # Update comment
+    updated_comment = await crud_comment.update_comment(db, comment, {"content": content})
+
+    # Invalidate caches
+    await cache.delete_pattern(f"comments:*")
+    await cache.delete(f"task:{comment.task_id}")
+
+    logger.info("Comment updated",
+                extra={"user_id": current_user.id, "comment_id": comment_id})
+    return updated_comment
+
+# ----- Delete comment -----
+@router.delete("/{comment_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_comment(
+        comment_id: int,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db_session)
+):
+    """Delete a comment."""
+    comment = await crud_comment.get_comment_by_id(db, comment_id)
+    if not comment:
+        logger.warning("Comment not found for deletion",
+                       extra={"user_id": current_user.id, "comment_id": comment_id})
+        raise HTTPException(status_code=404, detail="Comment not found")
+
+    if current_user.role != "admin" and comment.user_id != current_user.id:
+        logger.warning("Forbidden comment deletion attempt",
+                       extra={"user_id": current_user.id, "comment_id": comment_id})
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    task_id = comment.task_id
+    await crud_comment.delete_comment(db, comment)
+    # Invalidate caches
+    await cache.delete_pattern(f"comments:*")
+    await cache.delete(f"task:{task_id}")
+    logger.info("Comment deleted",
+                extra={"user_id": current_user.id, "comment_id": comment_id, "task_id": task_id})
+    return None
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\api\v1\routes\task.py =====
+
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Header
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import List, Optional
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+from app.api.v1.crud import task as crud_task
+from app.api.deps import get_db_session, get_current_user
+from app.models.user import User
+from app.schemas.task import TaskRead, TaskCreate, TaskUpdate
+from app.schemas.pagination import PaginatedResponse, PaginationParams, TaskFilters
+from app.core.cache import cache, make_task_cache_key, make_task_detail_cache_key, make_user_tasks_cache_key
+from app.worker import fetch_task_metadata
+import logging
+from pythonjsonlogger import jsonlogger
+
+# Custom key function for authenticated users
+def get_user_id_key(request):
+    user = request.state.user if hasattr(request.state, "user") else None
+    return f"user:{user.id}" if user else get_remote_address(request)
+
+limiter = Limiter(key_func=get_user_id_key)
+
+router = APIRouter(tags=["tasks"])
+
+@router.post("/", response_model=TaskRead, status_code=status.HTTP_201_CREATED)
+@limiter.limit("50/minute")
+async def create_task(
+        request,  # Required for slowapi
+        task_in: TaskCreate,
+        idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db_session)
+):
+    # Check idempotency key
+    if idempotency_key:
+        cached_response = await cache.get_idempotency(idempotency_key)
+        if cached_response:
+            logger.info("Idempotent request detected, returning cached response",
+                        extra={"user_id": current_user.id, "idempotency_key": idempotency_key})
+            return TaskRead(**cached_response)
+    # Create task
+    task = await crud_task.create_task(db, task_in, owner_id=current_user.id)
+
+    # Store response for idempotency
+    if idempotency_key:
+        await cache.set_idempotency(idempotency_key, TaskRead.from_orm(task).dict())
+        logger.info("Stored idempotency response",
+                    extra={"user_id": current_user.id, "idempotency_key": idempotency_key, "task_id": task.id})
+
+    # Invalidate cache and trigger background job
+    await cache.delete_pattern(make_user_tasks_cache_key(current_user.id))
+    fetch_task_metadata.delay(task.id)
+
+    logger.info("Task created", extra={"user_id": current_user.id, "task_id": task.id})
+
+    return task
+
+@router.get("/", response_model=PaginatedResponse[TaskRead])
+@limiter.limit("100/minute")
+async def get_tasks(
+        request,  # Add request parameter
+        page: int = Query(1, ge=1, description="Page number"),
+        page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+        status: Optional[str] = Query(None, description="Filter by status"),
+        owner_id: Optional[int] = Query(None, description="Filter by owner ID (admin only)"),
+        title_contains: Optional[str] = Query(None, description="Search in title"),
+        created_after: Optional[str] = Query(None, description="Filter created after date (ISO format)"),
+        created_before: Optional[str] = Query(None, description="Filter created before date (ISO format)"),
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db_session)
+):
+    pagination = PaginationParams(page=page, page_size=page_size)
+    filters = TaskFilters(
+        status=status,
+        owner_id=owner_id if current_user.role == "admin" else None,
+        title_contains=title_contains,
+        created_after=created_after,
+        created_before=created_before
+    )
+    cache_key = make_task_cache_key(
+        current_user.id,
+        {
+            "page": page,
+            "page_size": page_size,
+            "status": status,
+            "owner_id": filters.owner_id,
+            "title_contains": title_contains,
+            "created_after": created_after,
+            "created_before": created_before,
+            "is_admin": current_user.role == "admin"
+        }
+    )
+    cached_result = await cache.get(cache_key)
+    if cached_result:
+        return PaginatedResponse(**cached_result)
+    tasks, total = await crud_task.get_tasks_with_pagination(
+        db=db,
+        pagination=pagination,
+        filters=filters,
+        current_user_id=current_user.id,
+        is_admin=current_user.role == "admin"
+    )
+    response = PaginatedResponse.create(
+        items=[TaskRead.from_orm(task) for task in tasks],
+        total=total,
+        page=page,
+        page_size=page_size
+    )
+    await cache.set(cache_key, response.dict(), expire_seconds=300)
+    logger.info("Fetched tasks from DB and cached",
+                extra={"user_id": current_user.id, "cache_key": cache_key, "total_tasks": total})
+    return response
+
+@router.get("/{task_id}", response_model=TaskRead)
+@limiter.limit("100/minute")
+async def get_task(
+        request,  # Add request parameter
+        task_id: int,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db_session)
+):
+    cache_key = make_task_detail_cache_key(task_id)
+    cached_task = await cache.get(cache_key)
+    if cached_task:
+        if current_user.role != "admin" and cached_task["owner_id"] != current_user.id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        logger.info("Retrieved task from cache",
+                    extra={"user_id": current_user.id, "task_id": task_id, "cache_key": cache_key})
+        return TaskRead(**cached_task)
+    task = await crud_task.get_task_by_id(db, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if current_user.role != "admin" and task.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    task_data = TaskRead.from_orm(task)
+    await cache.set(cache_key, task_data.dict(), expire_seconds=600)
+    logger.info("Fetched task from DB and cached",
+                extra={"user_id": current_user.id, "task_id": task_id, "cache_key": cache_key})
+    return task_data
+
+@router.patch("/{task_id}", response_model=TaskRead)
+@limiter.limit("50/minute")
+async def update_task(
+        request,  # Already present
+        task_id: int,
+        task_update: TaskUpdate,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db_session)
+):
+    task = await crud_task.get_task_by_id(db, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if current_user.role != "admin" and task.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    update_data = task_update.dict(exclude_unset=True)
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    updated_task = await crud_task.update_task(db, task_id, update_data)
+    if not updated_task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    await cache.delete(make_task_detail_cache_key(task_id))
+    await cache.delete_pattern(make_user_tasks_cache_key(current_user.id))
+    if current_user.role == "admin":
+        await cache.delete_pattern("tasks:user:*")
+    logger.info("Task updated",
+                extra={"user_id": current_user.id, "task_id": task_id, "updates": update_data})
+    return TaskRead.from_orm(updated_task)
+@router.delete("/{task_id}", status_code=status.HTTP_204_NO_CONTENT)
+@limiter.limit("50/minute")
+async def delete_task(
+        request,  # Already present
+        task_id: int,
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db_session)
+):
+    task = await crud_task.get_task_by_id(db, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if current_user.role != "admin" and task.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    await crud_task.delete_task(db, task)
+    await cache.delete(make_task_detail_cache_key(task_id))
+    await cache.delete_pattern(make_user_tasks_cache_key(current_user.id))
+    logger.info("Task deleted", extra={"user_id": current_user.id, "task_id": task_id})
+    return None
+
+@router.get("/stats/summary", response_model=dict)
+@limiter.limit("20/minute")
+async def get_task_stats(
+        request,  # Already present
+        current_user: User = Depends(get_current_user),
+        db: AsyncSession = Depends(get_db_session)
+):
+    cache_key = f"task_stats:user:{current_user.id}"
+    cached_stats = await cache.get(cache_key)
+    if cached_stats:
+        logger.info("Retrieved task stats from cache",
+                    extra={"user_id": current_user.id, "cache_key": cache_key})
+        return cached_stats
+    stats = await crud_task.get_task_statistics(db, current_user.id)
+    await cache.set(cache_key, stats, expire_seconds=120)
+    logger.info("Fetched task stats from DB and cached",
+                extra={"user_id": current_user.id, "cache_key": cache_key})
+    return stats
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\api\v1\routes\user.py =====
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import List
+from datetime import timedelta
+import logging
+from pythonjsonlogger import jsonlogger
+
+from app.api.v1.crud import user as crud_user
+from app.api.deps import get_db_session, get_current_user
+from app.models.user import User
+from app.schemas.user import UserRead, UserCreate, UserUpdate
+
+# Configure JSON logger
+logger = logging.getLogger("task_manager.user")
+log_handler = logging.StreamHandler()
+formatter = jsonlogger.JsonFormatter(
+    fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ"
+)
+log_handler.setFormatter(formatter)
+logger.addHandler(log_handler)
+logger.setLevel(logging.INFO)
+
+# Only define router here, NO prefix
+router = APIRouter(tags=["users"])
+
+# ---------------------------
+# Seed test user (dev only)
+# ---------------------------
+@router.post("/seed", status_code=status.HTTP_201_CREATED)
+async def seed_test_user(db: AsyncSession = Depends(get_db_session)):
+    test_user = await crud_user.get_user_by_email(db, "test@example.com")
+    if not test_user:
+        await crud_user.create_user(db, UserCreate(
+            username="testuser", email="test@example.com", password="password123"
+        ))
+        logger.info("Test user created", extra={"email": "test@example.com"})
+    return {"message": "Test user created"}
+
+# ---------------------------
+# Get current logged-in user
+# ---------------------------
+@router.get("/me", response_model=UserRead)
+async def read_current_user(current_user: User = Depends(get_current_user)):
+    logger.info("User accessed /me", extra={"user_id": current_user.id})
+    return current_user
+
+# ---------------------------
+# List all users (admin only)
+# ---------------------------
+@router.get("/", response_model=List[UserRead])
+async def read_users(
+        db: AsyncSession = Depends(get_db_session),
+        current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return await crud_user.get_all_users(db)
+
+# ---------------------------
+# Get user by ID (admin only)
+# ---------------------------
+@router.get("/{user_id}", response_model=UserRead)
+async def read_user(
+        user_id: int,
+        db: AsyncSession = Depends(get_db_session),
+        current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    db_user = await crud_user.get_user_by_id(db, user_id)
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return db_user
+
+# ---------------------------
+# Update user (admin only)
+# ---------------------------
+@router.patch("/{user_id}", response_model=UserRead)
+async def update_user(
+        user_id: int,
+        updates: UserUpdate,
+        db: AsyncSession = Depends(get_db_session),
+        current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    db_user = await crud_user.get_user_by_id(db, user_id)
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    update_data = updates.dict(exclude_unset=True)  # only fields provided by the client
+    updated_user = await crud_user.update_user(db, db_user, update_data)
+
+    # ----------------- Logging/Auditing -----------------
+    print(f"[AUDIT] User {current_user.id} updated user {user_id}: {update_data}")
+
+    return updated_user
+
+# ---------------------------
+# Delete user (admin only)
+# ---------------------------
+@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_user(
+        user_id: int,
+        db: AsyncSession = Depends(get_db_session),
+        current_user: User = Depends(get_current_user)
+):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="Forbidden")
+    db_user = await crud_user.get_user_by_id(db, user_id)
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found")
+    await crud_user.delete_user(db, db_user)
+    return
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\api\v1\routes\__init__.py =====
+
+
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\celery_app\helpers.py =====
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.api.v1.crud import task as crud_task
+
+async def fetch_external_data_and_update(db: AsyncSession, task_id: int):
+    """
+    Fetch data from an external API and update the task in DB.
+    """
+    # Example external API call (replace with your real API logic)
+    import httpx
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get("https://jsonplaceholder.typicode.com/todos/1")
+        if response.status_code == 200:
+            data = response.json()
+            # Update task description with external data
+            task_data = {
+                "description": f"{data.get('title')} (fetched from API)",
+                "task_metadata": data
+            }
+            await crud_task.update_task(db, task_id, task_data)
+
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\celery_app\tasks.py =====
+
+import asyncio
+from app.db.session import AsyncSessionLocal
+from app.celery_app.helpers import fetch_external_data_and_update
+from app.core.celery_app import celery_app
+
+@celery_app.task
+def fetch_and_update_task(task_id: int):
+    """
+    Celery task to fetch external data and update task in background.
+
+    Args:
+        task_id: ID of the task to update
+    """
+    async def _run():
+        async with AsyncSessionLocal() as db:
+            await fetch_external_data_and_update(db, task_id)
+
+    asyncio.run(_run())
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\celery_app\__init__.py =====
+
+
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\core\cache.py =====
+
+import redis.asyncio as redis
+import json
+import pickle
+from typing import Optional, Any, Union
+from app.core.config import settings
+import logging
+from pythonjsonlogger import jsonlogger
+
+# Configure JSON logger
+logger = logging.getLogger("task_manager.cache")
+log_handler = logging.StreamHandler()
+formatter = jsonlogger.JsonFormatter(
+    fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ"
+)
+log_handler.setFormatter(formatter)
+logger.addHandler(log_handler)
+logger.setLevel(logging.INFO)
+
+class RedisCache:
+    def __init__(self):
+        self.redis_client: Optional[redis.Redis] = None
+
+    async def connect(self):
+        """Initialize Redis connection"""
+        if not self.redis_client:
+            self.redis_client = redis.from_url(
+                settings.REDIS_URL,
+                encoding="utf-8",
+                decode_responses=False
+            )
+            logger.info("Connected to Redis", extra={"url": settings.REDIS_URL})
+
+    async def disconnect(self):
+        """Close Redis connection"""
+        if self.redis_client:
+            logger.info("Disconnecting from Redis")
+            await self.redis_client.close()
+
+    async def get(self, key: str) -> Optional[Any]:
+        """Get value from cache"""
+        if not self.redis_client:
+            await self.connect()
+        try:
+            value = await self.redis_client.get(key)
+            if value:
+                try:
+                    return json.loads(value.decode('utf-8'))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    return pickle.loads(value)
+            return None
+        except Exception as e:
+            logger.error("Cache get error", extra={"key": key, "error": str(e)})
+            return None
+
+    async def set(self, key: str, value: Any, expire_seconds: int = 300) -> bool:
+        """Set value in cache with expiration"""
+        if not self.redis_client:
+            await self.connect()
+        try:
+            try:
+                serialized = json.dumps(value, default=str)
+            except (TypeError, ValueError):
+                serialized = pickle.dumps(value)
+            await self.redis_client.setex(key, expire_seconds, serialized)
+            logger.debug("Cache set", extra={"key": key, "expire_seconds": expire_seconds})
+            return True
+        except Exception as e:
+            logger.error("Cache set error", extra={"key": key, "error": str(e)})
+            return False
+
+    async def delete(self, key: str) -> bool:
+        """Delete key from cache"""
+        if not self.redis_client:
+            await self.connect()
+        try:
+            result = await self.redis_client.delete(key)
+            logger.debug("Cache delete", extra={"key": key, "result": result})
+            return result > 0
+        except Exception as e:
+            logger.error("Cache delete error", extra={"key": key, "error": str(e)})
+            return False
+
+    async def delete_pattern(self, pattern: str) -> int:
+        """Delete all keys matching pattern"""
+        if not self.redis_client:
+            await self.connect()
+        try:
+            keys = await self.redis_client.keys(pattern)
+            if keys:
+                result = await self.redis_client.delete(*keys)
+                logger.debug("Cache delete pattern", extra={"pattern": pattern, "keys_deleted": result})
+                return result
+            return 0
+        except Exception as e:
+            logger.error("Cache delete pattern error", extra={"pattern": pattern, "error": str(e)})
+            return 0
+
+    async def get_idempotency(self, key: str) -> Optional[dict]:
+        """Get idempotency response from cache"""
+        return await self.get(f"idempotency:{key}")
+
+    async def set_idempotency(self, key: str, response: dict) -> bool:
+        """Set idempotency response in cache with 24-hour expiration"""
+        return await self.set(f"idempotency:{key}", response, expire_seconds=86400)
+
+cache = RedisCache()
+
+# Cache key generators
+def make_task_cache_key(user_id: int, filters: dict) -> str:
+    """Generate cache key for task list"""
+    filter_str = "_".join(f"{k}:{v}" for k, v in sorted(filters.items()) if v is not None)
+    return f"tasks:user:{user_id}:{hash(filter_str)}"
+
+def make_task_detail_cache_key(task_id: int) -> str:
+    """Generate cache key for single task"""
+    return f"task:{task_id}"
+
+def make_user_tasks_cache_key(user_id: int) -> str:
+    """Generate cache key pattern for user's tasks"""
+    return f"tasks:user:{user_id}:*"
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\core\celery_app.py =====
+
+from celery import Celery
+from app.core.config import settings  # your settings module
+
+celery_app = Celery(
+    "worker",
+    broker=settings.REDIS_URL,
+    backend=settings.REDIS_URL
+)
+
+celery_app.conf.task_routes = {
+    "app.celery_app.tasks.fetch_and_update_task": {"queue": "tasks"},
+}
+
+# Optional: autodiscover tasks if you have many
+celery_app.autodiscover_tasks(["app.celery_app"])
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\core\config.py =====
+
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    PROJECT_NAME: str = "FastAPI Task Manager"
+    DATABASE_URL: str
+    SECRET_KEY: str
+    ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    REDIS_URL: str = "redis://localhost:6379/0"
+
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\core\exceptions.py =====
+
+from fastapi import HTTPException, Request, status
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import SQLAlchemyError
+from redis.exceptions import RedisError
+import logging
+
+logger = logging.getLogger(__name__)
+
+class CustomHTTPException(HTTPException):
+    def __init__(self, status_code: int, detail: str, error_code: str = None):
+        super().__init__(status_code, detail)
+        self.error_code = error_code
+
+async def database_exception_handler(request: Request, exc: SQLAlchemyError):
+    logger.error(f"Database error: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Database error occurred",
+            "error_code": "DATABASE_ERROR",
+            "request_id": getattr(request.state, "request_id", None)
+        }
+    )
+
+async def redis_exception_handler(request: Request, exc: RedisError):
+    logger.error(f"Redis error: {exc}")
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "Cache service unavailable",
+            "error_code": "CACHE_ERROR",
+            "request_id": getattr(request.state, "request_id", None)
+        }
+    )
+
+async def general_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unexpected error: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "Internal server error",
+            "error_code": "INTERNAL_ERROR",
+            "request_id": getattr(request.state, "request_id", None)
+        }
+    )
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\core\security.py =====
+
+from datetime import datetime, timedelta
+from typing import Optional
+
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+
+from app.core.config import settings
+from app.schemas.user import TokenData
+
+# Password hashing context (bcrypt is industry standard)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# ---------------------------
+# Password Hashing Utilities
+# ---------------------------
+def get_password_hash(password: str) -> str:
+    """Hash a plain-text password."""
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Verify a plain-text password against the stored hash."""
+    return pwd_context.verify(plain_password, hashed_password)
+
+# ---------------------------
+# JWT Token Utilities
+# ---------------------------
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    """
+    Generate a JWT token.
+    - data: dict containing claims (data: expects {'user_id': id, 'role': 'user/admin'})
+    - expires_delta: optional timedelta for expiry
+    """
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire, "sub": str(data["user_id"])})  # sub is user_id
+    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    return encoded_jwt
+
+def decode_access_token(token: str) -> Optional[TokenData]:
+    """
+     Decode a JWT token and return TokenData including userid and role.
+     If invalid or expired, return None.
+     """
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+        user_id: str = payload.get("sub")
+        role: str = payload.get("role")
+        if user_id is None or role is None:
+            return None
+        return TokenData(user_id=int(user_id), role=role)
+    except JWTError:
+        return None
+
+
+
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\core\__init__.py =====
+
+
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\db\base.py =====
+
+from sqlalchemy.orm import declarative_base
+
+Base = declarative_base()
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\db\session.py =====
+
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
+from app.core.config import settings
+
+engine = create_async_engine(settings.DATABASE_URL, echo=True)
+
+AsyncSessionLocal = sessionmaker(
+    bind=engine, class_=AsyncSession, expire_on_commit=False
+)
+
+# Dependency
+async def get_db_session() -> AsyncSession:
+    async with AsyncSessionLocal() as session:
+        yield session
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\db\__init__.py =====
+
+
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\models\audit_log.py =====
+
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, func
+from sqlalchemy.orm import relationship
+from app.db.base import Base
+from datetime import datetime
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    action = Column(String, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    timestamp = Column(DateTime(timezone=False), nullable=False, server_default=func.now(), default=datetime.utcnow)
+
+    # relationships
+    user = relationship("User", back_populates="audit_logs")
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\models\comment.py =====
+
+from datetime import datetime
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, func
+from sqlalchemy.orm import relationship
+from app.db.base import Base
+
+class Comment(Base):
+    __tablename__ = "comments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    content = Column(String, nullable=False)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now(), default=datetime.utcnow)
+
+    # relationships
+    author = relationship("User", back_populates="comments")
+    task = relationship("Task", back_populates="comments")
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\models\task.py =====
+
+from datetime import datetime
+from sqlalchemy import Column, Integer, String, ForeignKey, DateTime, func, JSON
+from sqlalchemy.orm import relationship
+from app.db.base import Base
+
+class Task(Base):
+    __tablename__ = "tasks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    status = Column(String, default="pending", nullable=False)
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now(), default=datetime.utcnow)
+
+    # NEW FIELD: store external API metadata
+    task_metadata = Column(JSON, nullable=True) # add a task_metadata JSON field so we can store the external API response when Celery updates the task.
+
+    # relationships
+    owner = relationship("User", back_populates="tasks")
+    comments = relationship("Comment", back_populates="task")
+
+    def is_completed(self) -> bool:
+        """Check if task is completed"""
+        return self.status.lower() == "completed"
+
+    def is_pending(self) -> bool:
+        """Check if task is pending"""
+        return self.status.lower() == "pending"
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\models\user.py =====
+
+from datetime import datetime
+from sqlalchemy import Column, Integer, String, DateTime, func
+from sqlalchemy.orm import relationship
+from app.db.base import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True, nullable=False)
+    email = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    role = Column(String, default="user", nullable=False)
+    created_at = Column(DateTime(timezone=False), nullable=False, server_default=func.now(), default=datetime.utcnow)
+
+    # relationships
+    comments = relationship("Comment", back_populates="author")
+    tasks = relationship("Task", back_populates="owner")
+    audit_logs = relationship("AuditLog", back_populates="user")
+
+    def is_admin(self) -> bool:
+        return self.role.lower() == "admin"
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\models\__init__.py =====
+
+
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\schemas\audit_log.py =====
+
+
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\schemas\comment.py =====
+
+from pydantic import BaseModel
+from datetime import datetime
+
+class CommentCreate(BaseModel):
+    task_id: int
+    content: str
+    # Note: user_id will be set from authentication context, not from request body
+
+class CommentUpdate(BaseModel):
+    """Schema for updating comments"""
+    content: str
+
+class CommentRead(BaseModel):
+    id: int
+    content: str
+    task_id: int
+    user_id: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\schemas\pagination.py =====
+
+from pydantic import BaseModel, validator
+from typing import Generic, TypeVar, List, Optional
+from datetime import datetime
+
+T = TypeVar('T')
+
+class PaginationParams(BaseModel):
+    """Standard pagination parameters"""
+    page: int = 1
+    page_size: int = 20
+
+    @property
+    def offset(self) -> int:
+        return (self.page - 1) * self.page_size
+
+    @property
+    def limit(self) -> int:
+        return self.page_size
+
+class PaginatedResponse(BaseModel, Generic[T]):
+    """Generic paginated response"""
+    items: List[T]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+    has_next: bool
+    has_prev: bool
+
+    @classmethod
+    def create(
+            cls,
+            items: List[T],
+            total: int,
+            page: int,
+            page_size: int
+    ) -> "PaginatedResponse[T]":
+        total_pages = (total + page_size - 1) // page_size
+        return cls(
+            items=items,
+            total=total,
+            page=page,
+            page_size=page_size,
+            total_pages=total_pages,
+            has_next=page < total_pages,
+            has_prev=page > 1
+        )
+
+class TaskFilters(BaseModel):
+    """Task filtering parameters. Dates must be in ISO format (e.g., 2025-08-17T12:00:00Z or 2025-08-17T12:00:00+00:00)."""
+    status: Optional[str] = None
+    owner_id: Optional[int] = None
+    title_contains: Optional[str] = None
+    created_after: Optional[str] = None  # ISO date string
+    created_before: Optional[str] = None  # ISO date string
+
+    @validator("created_after", "created_before")
+    def validate_date(cls, value):
+        if value:
+            try:
+                datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                raise ValueError("Invalid ISO date format")
+        return value
+
+class CommentFilters(BaseModel):
+    """Comment filtering parameters"""
+    task_id: Optional[int] = None
+    user_id: Optional[int] = None
+    content_contains: Optional[str] = None
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\schemas\task.py =====
+
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
+from datetime import datetime
+### After the Celery job fetches external API data and updates the DB, if you fetch the task again via /tasks/{id}, you’ll see the updated metadata.
+class TaskCreate(BaseModel):
+    title: str
+    description: Optional[str] = None
+    status: str = "pending"
+
+
+class TaskUpdate(BaseModel):
+    """Schema for updating tasks - all fields optional"""
+    title: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = None
+
+
+class TaskRead(BaseModel):
+    id: int
+    title: str
+    description: Optional[str]
+    status: str
+    owner_id: int
+    created_at: datetime
+    task_metadata: Optional[Dict[str, Any]] = None   # to support Celery's external API integration
+
+    class Config:
+        from_attributes = True
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\schemas\user.py =====
+
+from pydantic import BaseModel, EmailStr, ConfigDict, constr
+from datetime import datetime
+from typing import Optional
+
+# Shared properties between multiple user schemas
+class UserBase(BaseModel):
+    username: str
+    email: EmailStr
+    role: str = "user"  # default role
+
+# Schema for creating a new user (request body)
+class UserCreate(UserBase):
+    password: str
+
+# Schema for reading user data in responses (no password)
+class UserRead(UserBase):
+    id: int
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)  # Pydantic v2 style
+
+# Schema for JWT token response
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+# Schema for decoded JWT token data
+class TokenData(BaseModel):
+    user_id: Optional[int] = None  # JWT sub
+    role: Optional[str] = "user"
+
+# ---------------------------
+# Schema for updating user (optional fields + validation)
+# ---------------------------
+class UserUpdate(BaseModel):
+    username: Optional[constr(min_length=3, max_length=50)]
+    email: Optional[EmailStr]
+    password: Optional[constr(min_length=6)]
+    role: Optional[constr(min_length=3, max_length=20)]
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\schemas\__init__.py =====
+
+
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\tests\test_auth.py =====
+
+# tests/test_auth.py
+from fastapi.testclient import TestClient
+from app.main import app
+
+client = TestClient(app)
+
+def test_user_login():
+    response = client.post("/users/login", json={"email": "test@example.com", "password": "password123"})
+    assert response.status_code == 200
+    assert "access_token" in response.json()
+
+def test_protected_route():
+    login_response = client.post("/users/login", json={"email": "test@example.com", "password": "password123"})
+    token = login_response.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    response = client.get("/users/me", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["email"] == "test@example.com"
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\tests\test_rate_limit.py =====
+
+from fastapi.testclient import TestClient
+from app.main import app
+import pytest
+
+client = TestClient(app)
+
+@pytest.mark.asyncio
+async def test_login_rate_limit():
+    # Simulate exceeding rate limit (10/minute for /login)
+    for _ in range(11):
+        response = client.post("/api/v1/auth/login", json={"username": "test@example.com", "password": "wrong"})
+    assert response.status_code == 429
+    assert response.json()["detail"] == "Rate limit exceeded"
+
+@pytest.mark.asyncio
+async def test_task_create_rate_limit():
+    # Login to get token
+    login_response = client.post("/api/v1/auth/login", json={"username": "test@example.com", "password": "password123"})
+    assert login_response.status_code == 200
+    token = login_response.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Simulate exceeding rate limit (50/minute for /tasks/)
+    for _ in range(51):
+        response = client.post("/api/v1/tasks/", json={"title": "Test Task"}, headers=headers)
+    assert response.status_code == 429
+    assert response.json()["detail"] == "Rate limit exceeded"
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\tests\test_retries.py =====
+
+import pytest
+from httpx import RequestError
+from app.worker import fetch_task_metadata
+
+@pytest.mark.asyncio
+async def test_fetch_task_metadata_retry(monkeypatch):
+    async def mock_get(*args, **kwargs):
+        raise RequestError("Network error")
+    monkeypatch.setattr("httpx.AsyncClient.get", mock_get)
+    with pytest.raises(RequestError):  # Should fail after 3 retries
+        await fetch_task_metadata(1)
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\tests\test_task.py =====
+
+import pytest
+from fastapi.testclient import TestClient
+from app.main import app
+
+client = TestClient(app)
+
+@pytest.mark.asyncio
+async def test_task_filter_invalid_date():
+    login_response = client.post("/api/v1/auth/login", json={"username": "test@example.com", "password": "password123"})
+    token = login_response.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    response = client.get("/api/v1/tasks/?created_after=invalid-date", headers=headers)
+    assert response.status_code == 400
+    assert "Invalid created_after date format" in response.json()["detail"]
+
+===== FILE: D:\Personal\Learning\Python\Projects2025\fastapi_task_manager\app\tests\__init__.py =====
+

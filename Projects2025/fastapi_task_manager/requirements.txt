@@ -1,0 +1,9 @@
+fastapi[all]
+sqlalchemy[asyncio]
+asyncpg
+alembic
+uvicorn
+python-dotenv
+passlib[bcrypt]
+PyJWT
+httpx
